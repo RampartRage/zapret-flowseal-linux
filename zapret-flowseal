@@ -1,0 +1,1153 @@
+#!/usr/bin/env python3
+"""Console adapter for Flowseal zapret strategies on Linux (zapret2/nfqws2).
+
+Uses only strategies from https://github.com/Flowseal/zapret-discord-youtube.
+Keeps them in sync with upstream and can reload a running strategy on update.
+"""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import hashlib
+import json
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timezone
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from flowseal_convert import ConvertedStrategy, convert_strategy, render_config_value  # noqa: E402
+
+APP = "zapret-flowseal"
+DEFAULT_CONFIG = {
+    "upstream_repo": "https://github.com/Flowseal/zapret-discord-youtube.git",
+    "upstream_branch": "main",
+    "engine_repo": "https://github.com/bol-van/zapret2.git",
+    "engine_version": "auto",
+    "engine_dir": "/opt/zapret2",
+    "work_dir": "/opt/zapret2/flowseal",
+    "config_dir": "/etc/zapret-flowseal",
+    "strategy": "general (FAKE TLS AUTO)",
+    "game_filter": "off",
+    "game_filter_tcp": "1024-65535",
+    "game_filter_udp": "1024-65535",
+    "auto_restart": True,
+    "auto_engine_update": False,
+}
+MANAGED_BEGIN = "# >>> zapret-flowseal managed settings"
+MANAGED_END = "# <<< zapret-flowseal managed settings"
+BASE_TCP_PORTS = "80,443,2053,2083,2087,2096,8443"
+BASE_UDP_PORTS = "443,19294-19344,50000-50100"
+
+SYSTEMD_UNITS = {
+    "zapret-flowseal.service": """[Unit]
+Description=Zapret DPI bypass (Flowseal strategies)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/opt/zapret2/init.d/sysv/zapret2 start
+ExecStop=/opt/zapret2/init.d/sysv/zapret2 stop
+
+[Install]
+WantedBy=multi-user.target
+""",
+    "zapret-flowseal-update.service": """[Unit]
+Description=Sync Flowseal zapret configs from upstream
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/opt/zapret2/flowseal/tool/zapret-flowseal update --auto
+""",
+    "zapret-flowseal-update.timer": """[Unit]
+Description=Daily check for Flowseal config updates
+
+[Timer]
+OnBootSec=3min
+OnCalendar=daily
+Persistent=true
+RandomizedDelaySec=15min
+Unit=zapret-flowseal-update.service
+
+[Install]
+WantedBy=timers.target
+""",
+}
+
+
+class CLIError(Exception):
+    pass
+
+
+_USE_COLOR = sys.stdout.isatty() and os.environ.get("NO_COLOR") is None
+_PALETTE = {
+    "reset": "\033[0m",
+    "bold": "\033[1m",
+    "red": "\033[31m",
+    "green": "\033[32m",
+    "yellow": "\033[33m",
+    "blue": "\033[34m",
+    "cyan": "\033[36m",
+    "gray": "\033[90m",
+}
+
+
+def paint(text: str, color: str = "") -> str:
+    if not _USE_COLOR or not color:
+        return text
+    return f"{_PALETTE.get(color, '')}{text}{_PALETTE['reset']}"
+
+
+def clear_screen() -> None:
+    if _USE_COLOR:
+        sys.stdout.write("\033[2J\033[H")
+
+
+def log(message: str) -> None:
+    stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{stamp}] {message}", flush=True)
+
+
+def run(command: list[str], *, check: bool = True, capture: bool = False, cwd: str | None = None) -> subprocess.CompletedProcess[str]:
+    result = subprocess.run(command, text=True, capture_output=capture, cwd=cwd)
+    if check and result.returncode != 0:
+        detail = (result.stderr or result.stdout or "").strip()
+        raise CLIError(f"command failed ({result.returncode}): {' '.join(command)}\n{detail}")
+    return result
+
+
+def require_root() -> None:
+    if os.geteuid() != 0:
+        raise CLIError("this command needs root privileges: sudo zapret-flowseal <command>")
+
+
+def config_path(cfg: dict) -> Path:
+    return Path(os.environ.get("ZAPRET_FLOWSEAL_CONFIG", str(Path(cfg["config_dir"]) / "config.json")))
+
+
+def state_path(cfg: dict) -> Path:
+    return Path(cfg["work_dir"]) / "state.json"
+
+
+def load_config() -> dict:
+    path = Path(os.environ.get("ZAPRET_FLOWSEAL_CONFIG", "/etc/zapret-flowseal/config.json"))
+    cfg = dict(DEFAULT_CONFIG)
+    if path.exists():
+        try:
+            cfg.update(json.loads(path.read_text(encoding="utf-8")))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise CLIError(f"cannot read config {path}: {exc}") from exc
+    return cfg
+
+
+def save_config(cfg: dict) -> None:
+    path = config_path(cfg)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(cfg, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    os.chmod(path, 0o600)
+
+
+def load_state(cfg: dict) -> dict:
+    path = state_path(cfg)
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def save_state(cfg: dict, state: dict) -> None:
+    path = state_path(cfg)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(state, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+
+
+def lock(cfg: dict):
+    path = Path(cfg["work_dir"]) / "update.lock"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle = path.open("a+")
+    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    return handle
+
+
+def dirs(cfg: dict) -> dict[str, Path]:
+    work = Path(cfg["work_dir"])
+    engine = Path(cfg["engine_dir"])
+    return {
+        "work": work,
+        "upstream": work / "upstream",
+        "assets": work / "assets",
+        "lists": work / "assets" / "lists",
+        "generated": work / "generated",
+        "tool": work / "tool",
+        "engine": engine,
+        "engine_lua": engine / "lua",
+        "engine_bin": engine / "bin",
+        "init": engine / "init.d" / "sysv" / "zapret2",
+        "pidfile": Path("/var/run/nfqws2_1.pid"),
+    }
+
+
+def git(repo: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
+    return run(["git", "-C", str(repo), *args], check=check, capture=True)
+
+
+def is_installed(cfg: dict) -> bool:
+    d = dirs(cfg)
+    return (d["upstream"] / ".git").exists() and (d["engine"] / "init.d/sysv/zapret2").exists()
+
+
+def assert_installed(cfg: dict) -> dict[str, Path]:
+    d = dirs(cfg)
+    if not is_installed(cfg):
+        raise CLIError("not installed. Run: sudo zapret-flowseal install")
+    return d
+
+
+def strategies(d: dict[str, Path]) -> list[str]:
+    return sorted((path.stem for path in d["upstream"].glob("general*.bat")), key=str.lower)
+
+
+def game_values(cfg: dict) -> tuple[str, str]:
+    mode = cfg.get("game_filter", "off")
+    # Flowseal uses port 12 as an inert placeholder when the filter is off.
+    tcp = cfg["game_filter_tcp"] if mode in ("all", "tcp") else "12"
+    udp = cfg["game_filter_udp"] if mode in ("all", "udp") else "12"
+    return tcp, udp
+
+
+def firewall_ports(cfg: dict) -> tuple[str, str]:
+    mode = cfg.get("game_filter", "off")
+    tcp = BASE_TCP_PORTS
+    udp = BASE_UDP_PORTS
+    if mode in ("all", "tcp"):
+        tcp += "," + cfg["game_filter_tcp"]
+    if mode in ("all", "udp"):
+        udp += "," + cfg["game_filter_udp"]
+    return tcp, udp
+
+
+def build_args(cfg: dict, d: dict[str, Path], name: str | None = None, *, for_engine: bool = True) -> ConvertedStrategy:
+    name = name or cfg["strategy"]
+    path = d["upstream"] / f"{name}.bat"
+    if not path.exists():
+        raise CLIError(f"unknown strategy: {name}")
+    lua_dir = d["engine_lua"] if for_engine else d["assets"] / "lua"
+    tcp, udp = game_values(cfg)
+    return convert_strategy(
+        path,
+        lua_dir=str(lua_dir),
+        lists_dir=str(d["lists"]),
+        bin_dir=str(d["engine_bin"]),
+        engine_dir=str(d["engine"]) if for_engine else str(d["work"]),
+        game_tcp=tcp,
+        game_udp=udp,
+    )
+
+
+def detect_engine_version(upstream: Path) -> str | None:
+    binary = upstream / "bin" / "winws2.exe"
+    if not binary.exists():
+        return None
+    if shutil.which("strings"):
+        output = run(["strings", str(binary)], capture=True, check=False).stdout
+    else:
+        output = binary.read_bytes().decode("latin-1", errors="ignore")
+    match = re.search(r"^v(\d+\.\d+(?:\.\d+)*)$", output, re.MULTILINE)
+    return "v" + match.group(1) if match else None
+
+
+def normalize_lua(source: Path, target: Path) -> None:
+    target.write_bytes(source.read_bytes().replace(b"\r\n", b"\n"))
+
+
+def sync_assets(cfg: dict, d: dict[str, Path], *, force: bool = False) -> dict:
+    """Copy upstream assets, regenerate every Flowseal strategy config."""
+    upstream = d["upstream"]
+    for folder in (
+        d["assets"],
+        d["assets"] / "lua",
+        d["lists"],
+        d["generated"],
+        d["engine_lua"],
+        d["engine_bin"],
+    ):
+        folder.mkdir(parents=True, exist_ok=True)
+
+    copied_lists = 0
+    for source in sorted((upstream / "lists").glob("*")):
+        if not source.is_file() or source.name.endswith(".backup"):
+            continue
+        if source.name.endswith("-user.txt"):
+            continue  # user lists are owned by the user, never replaced
+        shutil.copy2(source, d["lists"] / source.name)
+        copied_lists += 1
+
+    for name, content in {
+        "ipset-exclude-user.txt": "203.0.113.113/32\n",
+        "list-general-user.txt": "# Never leave this file empty\ndomain.example.abc\n",
+        "list-exclude-user.txt": "domain.example.abc\n",
+    }.items():
+        target = d["lists"] / name
+        if not target.exists():
+            target.write_text(content, encoding="utf-8")
+
+    ipset_source = upstream / ".service" / "ipset-service.txt"
+    if ipset_source.exists():
+        ipset_target = d["lists"] / "ipset-all.txt"
+        if ipset_target.exists():
+            shutil.copy2(ipset_target, d["lists"] / "ipset-all.txt.backup")
+        shutil.copy2(ipset_source, ipset_target)
+
+    for source in sorted((upstream / "lua").glob("*.lua")):
+        normalize_lua(source, d["engine_lua"] / source.name)
+        normalize_lua(source, d["assets"] / "lua" / source.name)
+
+    for source in sorted((upstream / "bin").glob("*.bin")):
+        shutil.copy2(source, d["engine_bin"] / source.name)
+
+    generated: dict[str, str] = {}
+    warnings: list[str] = []
+    for name in strategies(d):
+        converted = build_args(cfg, d, name)
+        value = render_config_value(converted.args)
+        target = d["generated"] / f"{name}.conf"
+        target.write_text(value + "\n", encoding="utf-8")
+        generated[name] = hashlib.sha256(value.encode()).hexdigest()
+        warnings.extend(f"{name}: {item}" for item in converted.warnings)
+
+    return {
+        "lists": copied_lists,
+        "strategies": len(generated),
+        "hashes": generated,
+        "warnings": warnings,
+        "version": (upstream / ".service" / "version.txt").read_text(encoding="utf-8").strip()
+        if (upstream / ".service" / "version.txt").exists()
+        else None,
+    }
+
+
+def managed_config_block(cfg: dict, d: dict[str, Path], args: list[str]) -> str:
+    tcp, udp = firewall_ports(cfg)
+    lines = [
+        MANAGED_BEGIN,
+        "# Generated by zapret-flowseal from Flowseal/zapret-discord-youtube.",
+        "# Edit config.json, not this file.",
+        f"ZAPRET_BASE={d['engine']}",
+        "DESYNC_MARK=0x40000000",
+        "DESYNC_MARK_POSTNAT=0x20000000",
+        "NFQWS2_ENABLE=1",
+        f"NFQWS2_PORTS_TCP={tcp}",
+        f"NFQWS2_PORTS_UDP={udp}",
+        "NFQWS2_TCP_PKT_OUT=20",
+        "NFQWS2_TCP_PKT_IN=10",
+        "NFQWS2_UDP_PKT_OUT=5",
+        "NFQWS2_UDP_PKT_IN=3",
+        "MODE_FILTER=none",
+        "FLOWOFFLOAD=donttouch",
+        "INIT_APPLY_FW=1",
+        "DISABLE_IPV6=1",
+        'NFQWS2_OPT="',
+        *args,
+        '"',
+        MANAGED_END,
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def write_engine_config(cfg: dict, d: dict[str, Path]) -> str:
+    path = d["engine"] / "config"
+    if path.exists():
+        text = path.read_text(encoding="utf-8")
+    else:
+        text = (d["engine"] / "config.default").read_text(encoding="utf-8")
+    text = re.sub(
+        re.escape(MANAGED_BEGIN) + r".*?" + re.escape(MANAGED_END) + r"\n?",
+        "",
+        text,
+        flags=re.DOTALL,
+    )
+    converted = build_args(cfg, d)
+    text = text.rstrip() + "\n\n" + managed_config_block(cfg, d, converted.args)
+    path.write_text(text, encoding="utf-8")
+    return hashlib.sha256(converted.args[0].encode()).hexdigest()
+
+
+def is_running(d: dict[str, Path]) -> bool:
+    try:
+        pid = int(d["pidfile"].read_text().strip())
+    except (OSError, ValueError):
+        return False
+    return Path(f"/proc/{pid}").exists()
+
+
+def service_action(cfg: dict, action: str) -> None:
+    d = assert_installed(cfg)
+    if not d["init"].exists():
+        raise CLIError(f"missing init script: {d['init']}")
+    log(f"zapret2 {action}")
+    run([str(d["init"]), action])
+
+
+def fetch_upstream(cfg: dict, d: dict[str, Path]) -> tuple[bool, str, str]:
+    repo = d["upstream"]
+    branch = cfg["upstream_branch"]
+    git(repo, "fetch", "--quiet", "origin", branch)
+    old = git(repo, "rev-parse", "HEAD").stdout.strip()
+    new = git(repo, "rev-parse", "FETCH_HEAD").stdout.strip()
+    if old != new:
+        git(repo, "reset", "--hard", "--quiet", "FETCH_HEAD")
+    return old != new, old, new
+
+
+def upgrade_engine(cfg: dict, d: dict[str, Path], version: str) -> None:
+    repo = d["engine"]
+    log(f"upgrading zapret2 engine to {version}")
+    git(repo, "fetch", "--quiet", "--depth", "1", "origin", f"refs/tags/{version}:refs/tags/{version}", check=False)
+    git(repo, "checkout", "--quiet", "--detach", version)
+    run(["make", "-C", str(repo)])
+
+
+def install_units(cfg: dict) -> None:
+    target = Path("/etc/systemd/system")
+    target.mkdir(parents=True, exist_ok=True)
+    for name, content in SYSTEMD_UNITS.items():
+        path = target / name
+        rendered = (
+            content.replace("/opt/zapret2/flowseal", cfg["work_dir"])
+            .replace("/opt/zapret2", cfg["engine_dir"])
+        )
+        path.write_text(rendered, encoding="utf-8")
+        os.chmod(path, 0o644)
+    if shutil.which("systemctl") and Path("/run/systemd/system").exists():
+        run(["systemctl", "daemon-reload"])
+        log("systemd units installed (timer is not enabled automatically)")
+
+
+def copy_tool(cfg: dict, d: dict[str, Path]) -> None:
+    source = Path(__file__).resolve().parent
+    d["tool"].mkdir(parents=True, exist_ok=True)
+    for name in ("zapret-flowseal", "flowseal_convert.py"):
+        shutil.copy2(source / name, d["tool"] / name)
+        os.chmod(d["tool"] / name, 0o755)
+    shutil.copy2(source / "zapret", d["tool"] / "zapret")
+    os.chmod(d["tool"] / "zapret", 0o755)
+    for name in ("zapret", "zapret-flowseal"):
+        link = Path("/usr/local/bin") / name
+        if link.is_symlink() or link.exists():
+            link.unlink()
+        link.symlink_to(d["tool"] / name)
+
+
+def cmd_install(args: argparse.Namespace, cfg: dict) -> None:
+    require_root()
+    d = dirs(cfg)
+    for binary in ("git", "make", "gcc", "nft", "curl"):
+        if not shutil.which(binary):
+            raise CLIError(f"missing dependency: {binary}")
+
+    work = d["work"]
+    work.mkdir(parents=True, exist_ok=True)
+
+    if not (d["upstream"] / ".git").exists():
+        log("cloning Flowseal repository")
+        run(["git", "clone", "--depth", "1", "--branch", cfg["upstream_branch"], cfg["upstream_repo"], str(d["upstream"])])
+    else:
+        fetch_upstream(cfg, d)
+
+    detected = detect_engine_version(d["upstream"])
+    version = cfg["engine_version"]
+    if version == "auto":
+        version = detected or "v1.0.7"
+    if detected and detected != version:
+        log(f"WARNING: Flowseal binary is {detected}, selected engine is {version}")
+    cfg["engine_version"] = version
+
+    if not (d["engine"] / ".git").exists():
+        log(f"cloning zapret2 engine at {version}")
+        run(["git", "clone", "--depth", "1", "--branch", version, cfg["engine_repo"], str(d["engine"])])
+    else:
+        current = git(d["engine"], "describe", "--tags", "--exact-match", check=False).stdout.strip()
+        if current != version:
+            upgrade_engine(cfg, d, version)
+        else:
+            log(f"zapret2 engine already at {version}")
+
+    build_marker = d["engine"] / "nfq2" / "nfqws2"
+    if not build_marker.exists():
+        log("building nfqws2")
+        run(["make", "-C", str(d["engine"])])
+    if args.strategy:
+        cfg["strategy"] = args.strategy
+    save_config(cfg)
+
+    log("syncing Flowseal assets and generating strategies")
+    result = sync_assets(cfg, d, force=True)
+    state = load_state(cfg)
+    state.update(
+        {
+            "upstream_commit": git(d["upstream"], "rev-parse", "HEAD").stdout.strip(),
+            "flowseal_version": result["version"],
+            "engine_version": version,
+            "strategy_hashes": result["hashes"],
+            "last_sync": datetime.now(timezone.utc).isoformat(),
+        }
+    )
+    save_state(cfg, state)
+    write_engine_config(cfg, d)
+    install_units(cfg)
+    copy_tool(cfg, d)
+
+    log(f"installed: {result['strategies']} strategies, engine {version}")
+    log(f"active strategy: {cfg['strategy']}")
+    log("next: zapret  (interactive manager)  or: zapret list / zapret best --apply --start")
+
+
+def cmd_update(args: argparse.Namespace, cfg: dict) -> None:
+    require_root()
+    d = assert_installed(cfg)
+    handle = lock(cfg)
+    try:
+        changed, old, new = fetch_upstream(cfg, d)
+        if not changed and not args.force:
+            log(f"no upstream changes ({new[:12]})")
+            return
+
+        log(f"upstream updated: {old[:12]} -> {new[:12]}")
+        if args.engine or cfg.get("auto_engine_update"):
+            detected = detect_engine_version(d["upstream"])
+            if detected and detected != cfg["engine_version"]:
+                upgrade_engine(cfg, d, detected)
+                cfg["engine_version"] = detected
+                save_config(cfg)
+
+        state = load_state(cfg)
+        previous_hashes = state.get("strategy_hashes", {})
+        result = sync_assets(cfg, d, force=args.force)
+        active_changed = previous_hashes.get(cfg["strategy"]) != result["hashes"].get(cfg["strategy"])
+        write_engine_config(cfg, d)
+        if result["warnings"]:
+            log(f"conversion notices: {len(result['warnings'])} (Windows-only options / duplicate lua-init)")
+            for warning in result["warnings"][:5]:
+                log(f"  note: {warning}")
+
+        detected = detect_engine_version(d["upstream"])
+        if detected and detected != cfg["engine_version"]:
+            log(f"WARNING: Flowseal uses engine {detected}, installed engine is {cfg['engine_version']}. Run: sudo zapret-flowseal update --engine")
+
+        state.update(
+            {
+                "upstream_commit": new,
+                "flowseal_version": result["version"],
+                "engine_version": cfg["engine_version"],
+                "strategy_hashes": result["hashes"],
+                "last_sync": datetime.now(timezone.utc).isoformat(),
+                "last_active_config_sha256": result["hashes"].get(cfg["strategy"]),
+            }
+        )
+        save_state(cfg, state)
+
+        if active_changed and cfg.get("auto_restart") and is_running(d):
+            log("active strategy changed - restarting")
+            service_action(cfg, "restart")
+        elif active_changed:
+            log("active strategy changed - restart it with: sudo zapret-flowseal restart")
+        else:
+            log("active strategy unchanged")
+    finally:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        handle.close()
+
+
+def cmd_list(args: argparse.Namespace, cfg: dict) -> None:
+    d = assert_installed(cfg)
+    print(f"Flowseal strategies ({cfg['upstream_branch']}), active: {cfg['strategy']}\n")
+    for index, name in enumerate(strategies(d), start=1):
+        marker = "*" if name == cfg["strategy"] else " "
+        count = len(build_args(cfg, d, name).args)
+        print(f" {marker} {index:2d}. {name:<38} {count:3d} options")
+
+
+def resolve_strategy(cfg: dict, d: dict[str, Path], value: str) -> str:
+    names = strategies(d)
+    if value.isdigit() and 1 <= int(value) <= len(names):
+        return names[int(value) - 1]
+    for name in names:
+        if name.lower() == value.lower() or name.lower() == f"{value.lower()}.bat":
+            return name
+    raise CLIError(f"unknown strategy: {value}. Use 'zapret-flowseal list'")
+
+
+def cmd_use(args: argparse.Namespace, cfg: dict) -> None:
+    d = assert_installed(cfg)
+    require_root()
+    name = resolve_strategy(cfg, d, args.strategy)
+    was_running = is_running(d)
+    cfg["strategy"] = name
+    save_config(cfg)
+    write_engine_config(cfg, d)
+    log(f"active strategy: {name}")
+    if was_running:
+        service_action(cfg, "restart")
+    else:
+        log("zapret is not running; start it with: sudo zapret-flowseal start")
+
+
+def cmd_game_filter(args: argparse.Namespace, cfg: dict) -> None:
+    d = assert_installed(cfg)
+    require_root()
+    if args.mode not in ("off", "tcp", "udp", "all"):
+        raise CLIError("mode must be one of: off, tcp, udp, all")
+    cfg["game_filter"] = args.mode
+    cfg["game_filter_tcp"] = args.tcp
+    cfg["game_filter_udp"] = args.udp
+    save_config(cfg)
+    write_engine_config(cfg, d)
+    log(f"game filter: {args.mode}")
+    if is_running(d):
+        service_action(cfg, "restart")
+
+
+def cmd_service(args: argparse.Namespace, cfg: dict) -> None:
+    assert_installed(cfg)
+    require_root()
+    service_action(cfg, args.action)
+
+
+def cmd_status(args: argparse.Namespace, cfg: dict) -> None:
+    d = assert_installed(cfg)
+    state = load_state(cfg)
+    print(f"active strategy : {cfg['strategy']}")
+    print(f"game filter     : {cfg['game_filter']}")
+    print(f"engine          : {cfg['engine_version']} ({d['engine']})")
+    print(f"flowseal version: {state.get('flowseal_version', 'unknown')}")
+    print(f"upstream commit : {state.get('upstream_commit', 'unknown')}")
+    print(f"last sync       : {state.get('last_sync', 'never')}")
+    print(f"zapret daemon   : {'running' if is_running(d) else 'stopped'}")
+    if Path("/etc/systemd/system/zapret-flowseal-update.timer").exists():
+        result = run(["systemctl", "is-active", "zapret-flowseal-update.timer"], capture=True, check=False)
+        print(f"auto-update     : {result.stdout.strip() or 'unknown'}")
+
+
+def cmd_check(args: argparse.Namespace, cfg: dict) -> None:
+    d = assert_installed(cfg)
+    failures = 0
+    for name in strategies(d):
+        try:
+            converted = build_args(cfg, d, name)
+        except (ValueError, CLIError) as exc:
+            failures += 1
+            print(f"FAIL {name}: {exc}")
+            continue
+        leftovers = [token for token in converted.args if "%" in token or token.startswith("--wf-")]
+        if leftovers:
+            failures += 1
+            print(f"FAIL {name}: unconverted tokens: {leftovers}")
+        else:
+            print(f"OK   {name}: {len(converted.args)} options")
+    if failures:
+        raise CLIError(f"{failures} strategy check(s) failed")
+
+    binary = d["engine"] / "nfq2" / "nfqws2"
+    if binary.exists():
+        converted = build_args(cfg, d)
+        result = run([str(binary), "--dry-run", "--qnum=300", *converted.args], capture=True, check=False)
+        print(f"nfqws2 --dry-run: {'OK' if result.returncode == 0 else 'FAILED'}")
+        if result.returncode != 0:
+            print((result.stderr or result.stdout).strip())
+    else:
+        print("nfqws2 binary not built; skipping --dry-run")
+
+
+def cmd_auto_update(args: argparse.Namespace, cfg: dict) -> None:
+    require_root()
+    timer = "zapret-flowseal-update.timer"
+    if not Path("/run/systemd/system").exists():
+        print("systemd is not active. Use cron instead:")
+        print(f"  0 6 * * * /opt/zapret2/flowseal/tool/zapret-flowseal update --auto")
+        return
+    if args.action == "status":
+        result = run(["systemctl", "is-enabled", timer], capture=True, check=False)
+        print(result.stdout.strip() or "unknown")
+        return
+    action = "enable --now" if args.action == "on" else "disable --now"
+    run(["systemctl", *action.split(), timer])
+    log(f"auto-update {args.action}")
+
+
+def cmd_watch(args: argparse.Namespace, cfg: dict) -> None:
+    require_root()
+    interval = max(60, args.interval)
+    log(f"watching upstream every {interval}s (Ctrl-C to stop)")
+
+    def stop(_signum: int, _frame: object) -> None:
+        raise KeyboardInterrupt
+
+    signal.signal(signal.SIGTERM, stop)
+    try:
+        while True:
+            try:
+                cmd_update(argparse.Namespace(force=False, engine=False, auto=True), cfg)
+            except CLIError as exc:
+                log(f"update failed: {exc}")
+            time.sleep(interval)
+    except KeyboardInterrupt:
+        log("stopped")
+
+
+def cmd_uninstall(args: argparse.Namespace, cfg: dict) -> None:
+    require_root()
+    d = dirs(cfg)
+    if is_installed(cfg):
+        service_action(cfg, "stop")
+    for unit in SYSTEMD_UNITS:
+        run(["systemctl", "disable", "--now", unit], check=False)
+        path = Path("/etc/systemd/system") / unit
+        if path.exists():
+            path.unlink()
+    for name in ("zapret", "zapret-flowseal"):
+        link = Path("/usr/local/bin") / name
+        if link.is_symlink():
+            link.unlink()
+    if args.purge:
+        shutil.rmtree(d["work"], ignore_errors=True)
+        shutil.rmtree(cfg["config_dir"], ignore_errors=True)
+    else:
+        log(f"data kept in {d['work']} and {cfg['config_dir']}")
+    log("uninstalled")
+
+
+# ---------------------------------------------------------------------------
+# Interactive console, autostart, diagnostics and automatic strategy testing
+# ---------------------------------------------------------------------------
+
+URL_VARIANTS = (
+    ("HTTP", ["--http1.1"]),
+    ("TLS1.2", ["--tlsv1.2", "--tls-max", "1.2"]),
+    ("TLS1.3", ["--tlsv1.3", "--tls-max", "1.3"]),
+)
+
+
+def parse_targets(path: Path) -> list[dict[str, str]]:
+    """Parse Flowseal utils/targets.txt (Key = "URL" or "PING:ip")."""
+    targets: list[dict[str, str]] = []
+    if not path.exists():
+        return targets
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        match = re.match(r'^\s*(\w+)\s*=\s*"([^"]+)"', line)
+        if not match:
+            continue
+        name, value = match.group(1), match.group(2)
+        if value.upper().startswith("PING:"):
+            targets.append({"name": name, "kind": "ping", "value": value.split(":", 1)[1]})
+        else:
+            targets.append({"name": name, "kind": "url", "value": value})
+    return targets
+
+
+def probe_url(url: str, flags: list[str], timeout: int) -> str:
+    command = [
+        "curl", "-I", "-sS", "-m", str(timeout), "--connect-timeout", "2",
+        "-o", os.devnull, "-w", "%{http_code}", *flags, url,
+    ]
+    try:
+        result = subprocess.run(command, capture_output=True, text=True, timeout=timeout + 2)
+    except (OSError, subprocess.TimeoutExpired):
+        return "ERROR"
+    stderr = result.stderr.lower()
+    if any(word in stderr for word in ("certificate", "could not resolve host", "ssl connect", "handshake")):
+        return "SSL"
+    code = result.stdout.strip()
+    return "OK" if result.returncode == 0 and code.isdigit() and code != "000" else "ERROR"
+
+
+def probe_ping(host: str) -> bool:
+    try:
+        result = subprocess.run(
+            ["ping", "-c", "1", "-W", "1", host],
+            capture_output=True,
+            timeout=3,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return result.returncode == 0
+
+
+def test_strategy(targets: list[dict[str, str]], timeout: int, workers: int) -> dict:
+    jobs: list[tuple[str, str, object]] = []
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        for target in targets:
+            if target["kind"] == "url":
+                for label, flags in URL_VARIANTS:
+                    jobs.append((target["name"], label, pool.submit(probe_url, target["value"], flags, timeout)))
+            else:
+                jobs.append((target["name"], "PING", pool.submit(probe_ping, target["value"])))
+
+        tokens: dict[str, list[str]] = {}
+        for name, label, future in jobs:
+            try:
+                value = future.result()
+            except Exception:
+                value = False if label == "PING" else "ERROR"
+            if label == "PING":
+                token = f"PING:{'OK' if value else '--'}"
+            else:
+                token = f"{label}:{value}"
+            tokens.setdefault(name, []).append(token)
+
+    flat = [token for values in tokens.values() for token in values]
+    return {
+        "ok": sum(1 for token in flat if token.endswith(":OK")),
+        "ping_ok": sum(1 for token in flat if token == "PING:OK"),
+        "errors": sum(1 for token in flat if token.endswith((":ERROR", ":SSL"))),
+        "tokens": tokens,
+    }
+
+
+def cmd_best(args: argparse.Namespace, cfg: dict) -> None:
+    require_root()
+    d = assert_installed(cfg)
+    targets = parse_targets(d["upstream"] / "utils" / "targets.txt")
+    if not targets:
+        raise CLIError("utils/targets.txt not found in upstream")
+    original = cfg["strategy"]
+    was_running = is_running(d)
+    results: list[dict] = []
+    timeout = max(1, args.timeout)
+
+    names = strategies(d)
+    if args.limit:
+        names = names[: max(1, args.limit)]
+    print(paint(f"\nTesting {len(names)} Flowseal strategies "
+                f"({len(targets)} targets, timeout {timeout}s)\n", "bold"))
+    try:
+        for name in names:
+            print(paint(f"[{name}]", "cyan"), end=" ", flush=True)
+            try:
+                service_action(cfg, "stop")
+                cfg["strategy"] = name
+                write_engine_config(cfg, d)
+                service_action(cfg, "start")
+                if not wait_for_daemon(d, 4):
+                    print(paint("failed to start", "red"))
+                    results.append({"name": name, "ok": -1, "ping_ok": -1, "errors": 0, "tokens": {}})
+                    continue
+                result = test_strategy(targets, timeout, args.workers)
+                result["name"] = name
+                results.append(result)
+                color = "green" if result["ok"] > 0 else "red"
+                print(paint(f"OK={result['ok']:2d}  ping={result['ping_ok']:2d}  err={result['errors']:2d}", color))
+            except CLIError as exc:
+                print(paint(f"error: {exc}", "red"))
+                results.append({"name": name, "ok": -1, "ping_ok": -1, "errors": 0, "tokens": {}})
+    finally:
+        try:
+            service_action(cfg, "stop")
+        except CLIError:
+            pass
+        cfg["strategy"] = original
+        save_config(cfg)
+        write_engine_config(cfg, d)
+
+    ranked = sorted(results, key=lambda item: (item["ok"], item["ping_ok"]), reverse=True)
+    if not ranked:
+        raise CLIError("no strategy produced results")
+    best = ranked[0]
+    print()
+    print(paint("=== RESULTS ===", "bold"))
+    for item in ranked:
+        mark = paint("*", "green") if item is best else " "
+        print(f" {mark} {item['name']:<38} OK={item['ok']:3d}  ping={item['ping_ok']:2d}")
+
+    report_dir = d["work"] / "test-results"
+    report_dir.mkdir(parents=True, exist_ok=True)
+    report = report_dir / f"{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.txt"
+    lines = [f"best: {best['name']} (OK={best['ok']}, ping={best['ping_ok']})", ""]
+    for item in ranked:
+        lines.append(f"{item['name']}: OK={item['ok']} ping={item['ping_ok']} errors={item['errors']}")
+        for name, tokens in item["tokens"].items():
+            lines.append(f"  {name}: {' '.join(tokens)}")
+        lines.append("")
+    report.write_text("\n".join(lines), encoding="utf-8")
+
+    print(paint(f"\nBest strategy: {best['name']}", "green"))
+    print(f"Report: {report}")
+    if args.apply and best["ok"] > 0:
+        cfg["strategy"] = best["name"]
+        save_config(cfg)
+        write_engine_config(cfg, d)
+        log(f"applied: {best['name']}")
+        if was_running or args.start:
+            service_action(cfg, "start")
+
+
+def wait_for_daemon(d: dict[str, Path], seconds: int) -> bool:
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        if is_running(d):
+            return True
+        time.sleep(0.2)
+    return False
+
+
+def cmd_autostart(args: argparse.Namespace, cfg: dict) -> None:
+    require_root()
+    unit = "zapret-flowseal.service"
+    if not Path(f"/etc/systemd/system/{unit}").exists():
+        raise CLIError("systemd unit missing. Run install first")
+    if args.action == "status":
+        result = run(["systemctl", "is-enabled", unit], capture=True, check=False)
+        state = result.stdout.strip() or "unknown"
+        print(f"autostart: {paint(state, 'green' if state == 'enabled' else 'yellow')}")
+        return
+    if args.action == "on":
+        run(["systemctl", "enable", "--now", unit])
+        log("autostart enabled, zapret started")
+    else:
+        run(["systemctl", "disable", "--now", unit])
+        log("autostart disabled, zapret stopped")
+
+
+def cmd_diagnostics(args: argparse.Namespace, cfg: dict) -> None:
+    d = dirs(cfg)
+    checks: list[tuple[str, bool, str]] = []
+
+    def check(label: str, ok: bool, hint: str = "") -> None:
+        checks.append((label, ok, hint))
+
+    check("CLI config", config_path(cfg).exists(), "run install")
+    check("Flowseal upstream", (d["upstream"] / "general.bat").exists(), "run install")
+    check("zapret2 init script", d["init"].exists(), "run install")
+    check("nfqws2 binary", (d["engine"] / "nfq2" / "nfqws2").exists(), "run install")
+    check("engine config", (d["engine"] / "config").exists(), "run install")
+    check("blobs.lua", (d["engine_lua"] / "blobs.lua").exists(), "run update")
+    check("fake payloads", len(list(d["engine_bin"].glob("*.bin"))) >= 20, "run update")
+    check("generated strategies", len(list(d["generated"].glob("*.conf"))) >= 20, "run update")
+    check("active strategy", (d["upstream"] / f"{cfg['strategy']}.bat").exists(), "choose another strategy")
+    check("curl", shutil.which("curl") is not None, "install curl")
+    check("ping", shutil.which("ping") is not None, "install iputils-ping")
+    check("daemon running", is_running(d), "run: zapret start")
+    if os.geteuid() == 0:
+        table = run(["nft", "list", "table", "inet", "zapret2"], capture=True, check=False)
+        check("nftables table", table.returncode == 0, "run: zapret start")
+
+    print(paint("\n=== DIAGNOSTICS ===", "bold"))
+    for label, ok, hint in checks:
+        status = paint("OK", "green") if ok else paint("FAIL", "red")
+        suffix = f" ({hint})" if hint and not ok else ""
+        print(f"  [{status}] {label}{suffix}")
+    print()
+
+
+def invoke(argv: list[str], *, need_root: bool = True) -> int:
+    """Run another CLI command from the menu, escalating with sudo if needed."""
+    if need_root and os.geteuid() != 0:
+        return subprocess.run(["sudo", str(Path(__file__).resolve()), *argv]).returncode
+    try:
+        args = build_parser().parse_args(argv)
+        cfg = load_config()
+        args.func(args, cfg)
+        return 0
+    except CLIError as exc:
+        print(paint(f"error: {exc}", "red"), file=sys.stderr)
+        return 1
+
+
+def cmd_menu(args: argparse.Namespace, cfg: dict) -> None:
+    while True:
+        d = dirs(cfg)
+        clear_screen()
+        state = load_state(cfg)
+        running = is_running(d)
+        enabled = "unknown"
+        autoupdate = "unknown"
+        if Path("/run/systemd/system").exists():
+            enabled = run(["systemctl", "is-enabled", "zapret-flowseal.service"], capture=True, check=False).stdout.strip() or "unknown"
+            autoupdate = run(["systemctl", "is-active", "zapret-flowseal-update.timer"], capture=True, check=False).stdout.strip() or "unknown"
+
+        print(paint("  ZAPRET FLOWSEAL MANAGER  v1.0", "bold"))
+        print(paint("  " + "-" * 48, "gray"))
+        print(f"  Strategy      : {paint(cfg['strategy'], 'cyan')}")
+        print(f"  Service       : {paint('running' if running else 'stopped', 'green' if running else 'yellow')}")
+        print(f"  Autostart     : {paint(enabled, 'green' if enabled == 'enabled' else 'yellow')}")
+        print(f"  Auto-update   : {paint(autoupdate, 'green' if autoupdate == 'active' else 'yellow')}")
+        print(f"  Game filter   : {cfg['game_filter']}")
+        print(f"  Flowseal      : v{state.get('flowseal_version', '?')} ({state.get('upstream_commit', '?')[:8]})")
+        print()
+        print(paint("  :: SERVICE", "bold"))
+        print("     1. Install / reinstall")
+        print("     2. Install service (autostart ON)")
+        print("     3. Remove service (autostart OFF)")
+        print("     4. Check status")
+        print(paint("  :: STRATEGY", "bold"))
+        print("     5. Select strategy")
+        print("     6. Find best strategy (auto test)")
+        print("     7. Game filter")
+        print(paint("  :: UPDATES", "bold"))
+        print("     8. Update configs now")
+        print("     9. Auto-update check (on/off)")
+        print("    10. Update engine")
+        print(paint("  :: TOOLS", "bold"))
+        print("    11. Diagnostics")
+        print("    12. Dry-run check")
+        print()
+        print(paint("     0. Exit", "gray"))
+        print()
+
+        choice = input("  Select option: ").strip()
+        if choice == "0":
+            return
+        if choice == "1":
+            invoke(["install"], need_root=True)
+        elif choice == "2":
+            if not is_installed(cfg):
+                invoke(["install"], need_root=True)
+            invoke(["autostart", "on"], need_root=True)
+        elif choice == "3":
+            invoke(["autostart", "off"], need_root=True)
+        elif choice == "4":
+            invoke(["status"], need_root=False)
+        elif choice == "5":
+            if not is_installed(cfg):
+                print(paint("  Not installed. Choose option 1 first.", "red"))
+            else:
+                names = strategies(d)
+                for index, name in enumerate(names, 1):
+                    marker = "*" if name == cfg["strategy"] else " "
+                    print(f"  {marker} {index:2d}. {name}")
+                value = input("  Strategy number or name: ").strip()
+                if value:
+                    invoke(["use", value], need_root=True)
+        elif choice == "6":
+            if not is_installed(cfg):
+                print(paint("  Not installed. Choose option 1 first.", "red"))
+                input(paint("\n  Press Enter to continue...", "gray"))
+                continue
+            apply_best = input("  Apply the best strategy automatically? [y/N]: ").strip().lower() in ("y", "yes")
+            argv = ["best", "--apply"] if apply_best else ["best"]
+            invoke(argv, need_root=True)
+        elif choice == "7":
+            print("  1. off   2. all   3. tcp   4. udp")
+            mode = {"1": "off", "2": "all", "3": "tcp", "4": "udp"}.get(input("  Mode: ").strip())
+            if mode:
+                invoke(["game-filter", mode], need_root=True)
+        elif choice == "8":
+            invoke(["update"], need_root=True)
+        elif choice == "9":
+            current = "unknown"
+            if Path("/run/systemd/system").exists():
+                current = run(["systemctl", "is-active", "zapret-flowseal-update.timer"], capture=True, check=False).stdout.strip()
+            action = "off" if current == "active" else "on"
+            invoke(["auto-update", action], need_root=True)
+        elif choice == "10":
+            invoke(["update", "--engine"], need_root=True)
+        elif choice == "11":
+            invoke(["diagnostics"], need_root=False)
+        elif choice == "12":
+            invoke(["check"], need_root=False)
+        else:
+            print(paint("  Unknown option", "yellow"))
+        input(paint("\n  Press Enter to continue...", "gray"))
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog=APP, description="Flowseal zapret strategies on Linux")
+    sub = parser.add_subparsers(dest="command")
+
+    p = sub.add_parser("install", help="install engine, assets, configs and systemd units")
+    p.add_argument("--strategy", help="strategy to activate")
+    p.set_defaults(func=cmd_install)
+
+    p = sub.add_parser("list", help="list strategies from Flowseal repository")
+    p.set_defaults(func=cmd_list)
+
+    p = sub.add_parser("use", help="select a strategy by name or number")
+    p.add_argument("strategy")
+    p.set_defaults(func=cmd_use)
+
+    for action in ("start", "stop", "restart"):
+        p = sub.add_parser(action, help=f"{action} zapret")
+        p.set_defaults(func=cmd_service, action=action)
+
+    p = sub.add_parser("status", help="show current state")
+    p.set_defaults(func=cmd_status)
+
+    p = sub.add_parser("update", help="sync configs with upstream")
+    p.add_argument("--force", action="store_true")
+    p.add_argument("--engine", action="store_true", help="upgrade zapret2 if Flowseal bumped its version")
+    p.add_argument("--auto", action="store_true", help="quiet mode for the systemd timer")
+    p.set_defaults(func=cmd_update)
+
+    p = sub.add_parser("game-filter", help="toggle game traffic handling")
+    p.add_argument("mode", choices=["off", "tcp", "udp", "all"])
+    p.add_argument("--tcp", default="1024-65535")
+    p.add_argument("--udp", default="1024-65535")
+    p.set_defaults(func=cmd_game_filter)
+
+    p = sub.add_parser("auto-update", help="manage the update timer")
+    p.add_argument("action", choices=["on", "off", "status"])
+    p.set_defaults(func=cmd_auto_update)
+
+    p = sub.add_parser("check", help="validate every converted strategy")
+    p.set_defaults(func=cmd_check)
+
+    p = sub.add_parser("watch", help="poll upstream without systemd")
+    p.add_argument("--interval", type=int, default=3600)
+    p.set_defaults(func=cmd_watch)
+
+    p = sub.add_parser("uninstall", help="remove units and optionally all data")
+    p.add_argument("--purge", action="store_true")
+    p.set_defaults(func=cmd_uninstall)
+
+    p = sub.add_parser("menu", help="interactive console manager (default)")
+    p.set_defaults(func=cmd_menu)
+
+    p = sub.add_parser("best", help="test all Flowseal strategies and pick the best")
+    p.add_argument("--apply", action="store_true", help="activate the winning strategy")
+    p.add_argument("--start", action="store_true", help="start zapret after applying")
+    p.add_argument("--limit", type=int, help="test only the first N strategies")
+    p.add_argument("--timeout", type=int, default=5, help="per-request timeout in seconds")
+    p.add_argument("--workers", type=int, default=12, help="parallel checks")
+    p.set_defaults(func=cmd_best)
+
+    p = sub.add_parser("autostart", help="enable/disable start on boot")
+    p.add_argument("action", choices=["on", "off", "status"])
+    p.set_defaults(func=cmd_autostart)
+
+    p = sub.add_parser("diagnostics", help="check installation health")
+    p.set_defaults(func=cmd_diagnostics)
+    return parser
+
+
+def main() -> int:
+    args = build_parser().parse_args()
+    if args.command is None:
+        args = argparse.Namespace(command="menu", func=cmd_menu)
+    try:
+        cfg = load_config()
+        args.func(args, cfg)
+    except CLIError as exc:
+        print(paint(f"error: {exc}", "red"), file=sys.stderr)
+        return 1
+    except EOFError:
+        print()
+        return 0
+    except KeyboardInterrupt:
+        return 130
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

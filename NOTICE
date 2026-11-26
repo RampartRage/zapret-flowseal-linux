@@ -1,0 +1,19 @@
+This project is an adapter. It does not contain original strategies of its own.
+
+Upstream projects:
+
+1. Flowseal/zapret-discord-youtube
+   https://github.com/Flowseal/zapret-discord-youtube
+   Source of all general*.bat strategies, lists/, lua/ and bin/ fake payloads.
+   Licensed under the MIT License by Flowseal.
+
+2. bol-van/zapret2
+   https://github.com/bol-van/zapret2
+   Linux engine (nfqws2), init.d scripts and lua/ runtime.
+   Licensed under the MIT License by bol-van.
+
+The adapter code (flowseal_convert.py, zapret-flowseal, zapret, install-here.sh)
+is licensed under the MIT License, see LICENSE.
+
+No binary payloads, host lists or Lua strategy scripts are shipped in this
+repository: they are downloaded from upstream at install/update time.

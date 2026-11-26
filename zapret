@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# One-command launcher. Without arguments opens the interactive manager.
+# Usage: zapret [list|use|start|stop|restart|status|best|update|...]
+set -euo pipefail
+
+self="$(readlink -f "$0" 2>/dev/null || echo "$0")"
+dir="$(dirname "$self")"
+
+script=""
+for candidate in \
+    "$dir/zapret-flowseal" \
+    "/opt/zapret2/flowseal/tool/zapret-flowseal" \
+    "$HOME/Projects/zapret-flowseal-linux/zapret-flowseal"
+do
+    if [[ -f "$candidate" ]]; then
+        script="$candidate"
+        break
+    fi
+done
+
+if [[ -z "$script" ]]; then
+    echo "Cannot find zapret-flowseal. Run: sudo bash install-here.sh" >&2
+    exit 1
+fi
+
+if [[ $EUID -ne 0 ]]; then
+    exec sudo -E python3 "$script" "$@"
+fi
+exec python3 "$script" "$@"
