@@ -67,7 +67,7 @@ sudo python3 zapret-flowseal install --strategy 'general (FAKE TLS AUTO)'
 | `/opt/zapret2/flowseal/test-results/` | отчёты `zapret best` |
 | `/opt/zapret2/flowseal/state.json` | последний commit, версия, хеши стратегий |
 | `/etc/zapret-flowseal/config.json` | настройки адаптера |
-| `/etc/zapret2/config` → `/opt/zapret2/config` | активная стратегия в формате zapret2 |
+| `/opt/zapret2/config` | активная стратегия в формате zapret2 (`ZAPRET_CONFIG` в init-скрипте) |
 | `/usr/local/bin/zapret`, `/usr/local/bin/zapret-flowseal` | команды CLI |
 | `/etc/systemd/system/zapret-flowseal*` | сервис, юнит и таймер обновления |
 
