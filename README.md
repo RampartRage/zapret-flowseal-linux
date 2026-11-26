@@ -33,12 +33,21 @@ zapret
 Требования: Linux с `nftables`, root, `git`, `curl`, `gcc`, `make`, `nft`, `python3` 3.9+, заголовки `libnetfilter_queue` и Lua.
 
 ```bash
-git clone https://github.com/<ваш-логин>/zapret-flowseal-linux.git
+git clone https://github.com/RampartRage/zapret-flowseal-linux.git
 cd zapret-flowseal-linux
 sudo bash install-here.sh
 ```
 
 `install-here.sh` поставит недостающие dev-пакеты (Arch: `libnetfilter_queue luajit`; Debian/Ubuntu: `libnetfilter-queue-dev liblua5.1-0-dev`) и вызовет `zapret-flowseal install`.
+
+Установка не включает автозапуск и таймер обновления автоматически. После установки:
+
+```bash
+zapret autostart on     # включить демон и запустить его сейчас
+zapret auto-update on   # опционально: проверять upstream раз в сутки
+```
+
+Повторный `install` сохраняет пользовательские `*-user.txt` и не удаляет чужие данные: если `/opt/zapret2` уже есть, но не является репозиторием zapret2, он переносится в `/opt/zapret2.backup-<дата>`.
 
 Если зависимости уже есть:
 
