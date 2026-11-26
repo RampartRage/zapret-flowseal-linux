@@ -17,6 +17,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
@@ -197,6 +198,16 @@ def lock(cfg: dict):
     handle = path.open("a+")
     fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
     return handle
+
+
+def move_aside_if_foreign(path: Path) -> Path | None:
+    """Rename a non-empty directory that is not a git repo, keeping its data."""
+    if path.exists() and not (path / ".git").exists() and any(path.iterdir()):
+        backup = path.parent / f"{path.name}.backup-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+        log(f"каталог {path} непуст и не является репозиторием — перемещаю в {backup}")
+        path.rename(backup)
+        return backup
+    return None
 
 
 def dirs(cfg: dict) -> dict[str, Path]:
@@ -476,16 +487,25 @@ def cmd_install(args: argparse.Namespace, cfg: dict) -> None:
         if not shutil.which(binary):
             raise CLIError(f"не найдена зависимость: {binary}")
 
-    work = d["work"]
-    work.mkdir(parents=True, exist_ok=True)
-
-    if not (d["upstream"] / ".git").exists():
-        log("клонирую репозиторий Flowseal")
-        run(["git", "clone", "--depth", "1", "--branch", cfg["upstream_branch"], cfg["upstream_repo"], str(d["upstream"])])
-    else:
+    # Рабочий каталог лежит ВНУТРИ engine_dir, поэтому его нельзя создавать
+    # до клонирования zapret2. При первом запуске клонируем upstream во
+    # временный каталог; при повторном — обновляем уже существующий репозиторий.
+    upstream = d["upstream"]
+    tmp_root: Path | None = None
+    if (upstream / ".git").exists():
         fetch_upstream(cfg, d)
+    else:
+        if upstream.exists():
+            move_aside_if_foreign(upstream)
+        tmp_root = Path(tempfile.mkdtemp(prefix="zapret-flowseal-"))
+        upstream = tmp_root / "upstream"
+        log("клонирую репозиторий Flowseal")
+        run([
+            "git", "clone", "--depth", "1", "--branch", cfg["upstream_branch"],
+            cfg["upstream_repo"], str(upstream),
+        ])
+    detected = detect_engine_version(upstream)
 
-    detected = detect_engine_version(d["upstream"])
     version = cfg["engine_version"]
     if version == "auto":
         version = detected or "v1.0.7"
@@ -493,17 +513,44 @@ def cmd_install(args: argparse.Namespace, cfg: dict) -> None:
         log(f"ВНИМАНИЕ: бинарник Flowseal — {detected}, выбран движок {version}")
     cfg["engine_version"] = version
 
-    if not (d["engine"] / ".git").exists():
+    # Сохраняем пользовательские списки перед возможной заменой каталога.
+    user_lists: dict[str, bytes] = {}
+    old_lists = d["lists"]
+    if old_lists.exists():
+        for path in old_lists.glob("*-user.txt"):
+            user_lists[path.name] = path.read_bytes()
+
+    engine = d["engine"]
+    move_aside_if_foreign(engine)
+    engine.parent.mkdir(parents=True, exist_ok=True)
+
+    if not (engine / ".git").exists():
         log(f"клонирую zapret2 {version}")
-        run(["git", "clone", "--depth", "1", "--branch", version, cfg["engine_repo"], str(d["engine"])])
+        run(["git", "clone", "--depth", "1", "--branch", version, cfg["engine_repo"], str(engine)])
     else:
-        current = git(d["engine"], "describe", "--tags", "--exact-match", check=False).stdout.strip()
+        current = git(engine, "describe", "--tags", "--exact-match", check=False).stdout.strip()
         if current != version:
             upgrade_engine(cfg, d, version)
         else:
             log(f"движок zapret2 уже на {version}")
 
-    build_marker = d["engine"] / "nfq2" / "nfqws2"
+    work = d["work"]
+    work.mkdir(parents=True, exist_ok=True)
+    if upstream != d["upstream"]:
+        if d["upstream"].exists():
+            shutil.rmtree(d["upstream"])
+        shutil.move(str(upstream), str(d["upstream"]))
+    if tmp_root is not None:
+        shutil.rmtree(tmp_root, ignore_errors=True)
+
+    if user_lists:
+        new_lists = d["lists"]
+        new_lists.mkdir(parents=True, exist_ok=True)
+        for name, data in user_lists.items():
+            (new_lists / name).write_bytes(data)
+        log(f"сохранено пользовательских списков: {len(user_lists)}")
+
+    build_marker = engine / "nfq2" / "nfqws2"
     if not build_marker.exists():
         log("собираю nfqws2")
         run(["make", "-C", str(d["engine"])])
