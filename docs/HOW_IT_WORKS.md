@@ -67,7 +67,7 @@ NFQWS2_OPT в /opt/zapret2/config
 
 ## 4. Почему нельзя положить стратегию в `@file`
 
-`nfqws2` поддерживает `--@config_file`, но при использовании `@file` остальные CLI-опции игнорируются. Init-скрипт zapret2 сам добавляет `--qnum`, `--user`, `--fwmark`, `--lua-init`, поэтому стратегия должна быть **inline** в `NFQWS2_OPT`.
+`nfqws2` поддерживает `@config_file`, но при использовании `@file` остальные CLI-опции игнорируются. Init-скрипт zapret2 сам добавляет `--qnum`, `--user`, `--fwmark`, `--lua-init`, поэтому стратегия должна быть **inline** в `NFQWS2_OPT`.
 
 Для этого вместо одного `--@generated/general.conf` в конфиг пишется многострочное значение:
 
